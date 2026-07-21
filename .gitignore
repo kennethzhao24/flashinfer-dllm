@@ -26,6 +26,10 @@ flashinfer/cute_dsl/benchmark_gated_delta_rule.py
 # vscode
 .vscode/
 
+
+# results
+**/results/
+
 # zed text editor
 .zed/
 .rules

@@ -1,0 +1,16 @@
+  python pod_attn_tests/flx_pod.py \
+    --block-length 64 \
+    --head-dim 128 \
+    --page-size 64 \
+    --prefill-seq-lens 256,320,384,448,512,576,640,768 \
+    --decode-kv-lens 2048,2560,3072,3584,4096,4608,5120,6144 \
+    --num-q-heads 16 \
+    --num-kv-heads 4 \
+    --dtype bf16 \
+    --kv-layout NHD \
+    --pod-execution-mode true_prefill_decode_pod \
+    --pod-schedule-policy count_ratio \
+    --compare-correctness \
+    --benchmark-reference \
+    --warmup 10 \
+    --iters 100

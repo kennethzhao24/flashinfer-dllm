@@ -74,26 +74,47 @@ __global__ __launch_bounds__(std::max(
     const int prefill_slots = (prefill_blocks + blk_factor_p - 1) / blk_factor_p;
     const int decode_slots = (decode_blocks + blk_factor_d - 1) / blk_factor_d;
 
-    if (prefill_slots <= decode_slots) {
-      // Total tags = (decode + prefill) / min(decode, prefill)
-      // = 1 + decode / prefill; when prefill < decode
-      const int total_tags = decode_slots / prefill_slots + 1;
-      // For this SM, what's the next operation we want to run?
-      op = (atomicAdd(&sm_aware_sched[linear_bid], 1) % total_tags);
-      if (op > 0) {
-        op = 1;
-      }
-    } else {
-      // Total tags = (decode + prefill) / min(decode, prefill)
-      // = 1 + prefill / decode; when decode < prefill
-      const int pref_tags = prefill_slots / decode_slots;
+    constexpr int kWorkAwarePolicy = 1;
+    constexpr int kPrefillFirstPolicy = 2;
+    constexpr int kDecodeFirstPolicy = 3;
+    const int schedule_policy = sm_aware_sched[num_SMs + 2];
+    const int prefill_weight = max(1, sm_aware_sched[num_SMs + 3]);
+    const int decode_weight = max(1, sm_aware_sched[num_SMs + 4]);
 
-      // For this SM, what's the next operation we want to run?
-      op = (atomicAdd(&sm_aware_sched[linear_bid], 1) % (pref_tags + 1));
-      if (op < pref_tags) {
-        op = 0;
+    if (prefill_slots == 0) {
+      op = DECODE;
+    } else if (decode_slots == 0) {
+      op = PREFILL;
+    } else if (schedule_policy == kPrefillFirstPolicy) {
+      op = PREFILL;
+    } else if (schedule_policy == kDecodeFirstPolicy) {
+      op = DECODE;
+    } else if (schedule_policy == kWorkAwarePolicy) {
+      const int total_weight = prefill_weight + decode_weight;
+      const int tag = atomicAdd(&sm_aware_sched[linear_bid], 1) % total_weight;
+      op = (tag < prefill_weight) ? PREFILL : DECODE;
+    } else {
+      if (prefill_slots <= decode_slots) {
+        // Total tags = (decode + prefill) / min(decode, prefill)
+        // = 1 + decode / prefill; when prefill < decode
+        const int total_tags = decode_slots / prefill_slots + 1;
+        // For this SM, what's the next operation we want to run?
+        op = (atomicAdd(&sm_aware_sched[linear_bid], 1) % total_tags);
+        if (op > 0) {
+          op = DECODE;
+        }
       } else {
-        op = 1;
+        // Total tags = (decode + prefill) / min(decode, prefill)
+        // = 1 + prefill / decode; when decode < prefill
+        const int pref_tags = prefill_slots / decode_slots;
+
+        // For this SM, what's the next operation we want to run?
+        op = (atomicAdd(&sm_aware_sched[linear_bid], 1) % (pref_tags + 1));
+        if (op < pref_tags) {
+          op = PREFILL;
+        } else {
+          op = DECODE;
+        }
       }
     }
 
@@ -329,6 +350,9 @@ cudaError_t BatchPODWithKVCacheTensorDispatched(PrefillParams prefill_params,
           int num_sm = 0;
           FLASHINFER_CUDA_CALL(
               cudaDeviceGetAttribute(&num_sm, cudaDevAttrMultiProcessorCount, dev_id));
+          // Reset only the runtime counters. The schedule policy and weights are stored in
+          // sm_aware_sched[num_sm + 2 : num_sm + 5] by the Python plan() path and must
+          // survive across kernel launches.
           FLASHINFER_CUDA_CALL(
               cudaMemsetAsync(sm_aware_sched, 0, sizeof(int) * (num_sm + 2), stream));
 

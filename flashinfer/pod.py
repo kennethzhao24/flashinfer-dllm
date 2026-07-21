@@ -883,11 +883,21 @@ class BatchPODWithPagedKVCacheWrapper:
             device="cpu",
         )
 
-        # SM aware scheduling buffer, requires SMs count + 2 entries
+        # SM aware scheduling buffer:
+        # - num_sm entries: per-SM op selection counters
+        # - 2 entries: global prefill/decode CTA counters
+        # - 3 entries: policy, prefill weight, decode weight
         dev_prop = torch.cuda.get_device_properties(self.device)
         self._sm_aware_sched = torch.empty(
-            (dev_prop.multi_processor_count + 2), dtype=torch.int, device=self.device
+            (dev_prop.multi_processor_count + 5), dtype=torch.int, device=self.device
         )
+        self._num_sms = dev_prop.multi_processor_count
+        self._pod_schedule_policy = "work_aware"
+        self._pod_schedule_policy_id = 1
+        self._pod_prefill_work_estimate = 1
+        self._pod_decode_work_estimate = 1
+        self._pod_prefill_schedule_weight = 1
+        self._pod_decode_schedule_weight = 1
 
         self._fixed_batch_size = 0
 
@@ -900,6 +910,53 @@ class BatchPODWithPagedKVCacheWrapper:
     @property
     def is_cuda_graph_enabled(self) -> bool:
         return self._use_cuda_graph
+
+    @staticmethod
+    def _get_pod_schedule_policy_id(policy: str) -> int:
+        policy_ids = {
+            "count_ratio": 0,
+            "work_aware": 1,
+            "prefill_first": 2,
+            "decode_first": 3,
+        }
+        try:
+            return policy_ids[policy]
+        except KeyError as exc:
+            raise ValueError(
+                "pod_schedule_policy must be one of "
+                f"{tuple(policy_ids)}, got {policy!r}."
+            ) from exc
+
+    @staticmethod
+    def _estimate_pod_work(
+        qo_indptr_host: torch.Tensor,
+        kv_lens_host: torch.Tensor,
+        cta_tile_q: int,
+        page_size: int,
+        num_kv_heads: int,
+    ) -> int:
+        if len(kv_lens_host) == 0:
+            return 0
+        qo_lens = qo_indptr_host[1:] - qo_indptr_host[:-1]
+        work = 0
+        for qo_len, kv_len in zip(qo_lens.tolist(), kv_lens_host.tolist()):
+            q_tiles = max(1, math.ceil(int(qo_len) / int(cta_tile_q)))
+            kv_tiles = max(1, math.ceil(int(kv_len) / int(page_size)))
+            work += q_tiles * kv_tiles
+        return int(work) * int(num_kv_heads)
+
+    @staticmethod
+    def _pod_schedule_weights(prefill_work: int, decode_work: int) -> tuple[int, int]:
+        if prefill_work <= 0 and decode_work <= 0:
+            return 1, 1
+        if prefill_work <= 0:
+            return 1, 16
+        if decode_work <= 0:
+            return 16, 1
+        gcd = math.gcd(int(prefill_work), int(decode_work))
+        prefill_weight = max(1, min(16, int(prefill_work) // gcd))
+        decode_weight = max(1, min(16, int(decode_work) // gcd))
+        return prefill_weight, decode_weight
 
     @flashinfer_api
     def plan(
@@ -924,6 +981,7 @@ class BatchPODWithPagedKVCacheWrapper:
         sm_scale: Optional[float] = None,
         rope_scale: Optional[float] = None,
         rope_theta: Optional[float] = None,
+        pod_schedule_policy: str = "work_aware",
         non_blocking: bool = True,
     ) -> None:
         r"""Plan POD's batch prefill and decode for given problem specification.
@@ -979,6 +1037,11 @@ class BatchPODWithPagedKVCacheWrapper:
             ``1.0``.
         rope_theta : Optional[float]
             The theta used in RoPE, if not provided, will be set to ``1e4``.
+        pod_schedule_policy : str
+            CTA scheduling policy for the fused POD kernel. Supported values are
+            ``"count_ratio"`` (legacy behavior), ``"work_aware"``,
+            ``"prefill_first"``, and ``"decode_first"``. Defaults to
+            ``"work_aware"``.
         non_blocking : bool
             Whether to copy the input tensors to the device asynchronously, defaults to ``True``.
 
@@ -996,6 +1059,7 @@ class BatchPODWithPagedKVCacheWrapper:
         """
         # Logits soft cap is not supported currently
         logits_soft_cap = 0.0
+        pod_schedule_policy_id = self._get_pod_schedule_policy_id(pod_schedule_policy)
 
         # Setup prefill params
         batch_size_p = len(last_page_len_p)
@@ -1110,6 +1174,38 @@ class BatchPODWithPagedKVCacheWrapper:
             False,  # disable_split_kv
             num_colocated_ctas,
         )
+        prefill_work = self._estimate_pod_work(
+            qo_indptr_host_p,
+            kv_lens_arr_host_p,
+            int(self._plan_info_p[3]),
+            page_size,
+            num_kv_heads,
+        )
+        decode_work = self._estimate_pod_work(
+            qo_indptr_host_d,
+            kv_lens_arr_host_d,
+            int(self._plan_info_d[3]),
+            page_size,
+            num_kv_heads,
+        )
+        prefill_weight, decode_weight = self._pod_schedule_weights(
+            prefill_work, decode_work
+        )
+        self._pod_schedule_policy = pod_schedule_policy
+        self._pod_schedule_policy_id = pod_schedule_policy_id
+        self._pod_prefill_work_estimate = prefill_work
+        self._pod_decode_work_estimate = decode_work
+        self._pod_prefill_schedule_weight = prefill_weight
+        self._pod_decode_schedule_weight = decode_weight
+        self._sm_aware_sched[
+            self._num_sms + 2 : self._num_sms + 5
+        ].copy_(
+            torch.tensor(
+                [pod_schedule_policy_id, prefill_weight, decode_weight],
+                dtype=torch.int,
+                device=self.device,
+            )
+        )
         self._indptr_type = kv_indptr_p.dtype
         self._pos_encoding_mode = pos_encoding_mode
         self._window_left = window_left
@@ -1161,7 +1257,9 @@ class BatchPODWithPagedKVCacheWrapper:
             Paged KV cache for the prefill requests.  Layout matches
             ``kv_layout`` set in :meth:`__init__`.
         q_d : torch.Tensor
-            Decode query tensor, shape ``[batch_size_d, num_qo_heads, head_dim]``.
+            Decode query tensor, shape ``[qo_indptr_d[-1], num_qo_heads, head_dim]``.
+            Requests may contain one or more query tokens; the query segments are
+            described by ``qo_indptr_d`` passed to :meth:`plan`.
         paged_kv_cache_d : Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
             Paged KV cache for the decode requests.  Layout matches
             ``kv_layout`` set in :meth:`__init__`.
